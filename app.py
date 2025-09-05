@@ -1,15 +1,20 @@
 # app.py
-# Multifamily Lead Finder — Apartments.com + RentCafe (+ Entrata/Yardi follow) → CSV/XLSX/Google Sheets
-# - Input: City/State or a search URL (Apartments.com or RentCafe)
-# - Output: Property Name, Address, Management Company, Phone, Email, URLs
-# - Enrichment: follow "Managed by" or footer links (Entrata/Yardi/RentCafe sites) to find public email/phone
-# - Messaging: generates call scripts and email templates per property
-# - Export: CSV, XLSX, and Google Sheets (service account JSON in st.secrets["gcp_service_account"])
+# Multifamily Lead Finder — v2 (Apartments.com + RentCafe → CSV/XLSX/Google Sheets)
+# Key fixes in v2:
+# - Much more robust link collection from listing pages (adds JSON-LD ItemList parsing)
+# - Better anti-bot handling + human/captcha detection
+# - Optional manual paste of property URLs if listing pages are blocked
+# - Rotating User-Agents + optional Referer
+# - Clear diagnostics when 0 links found
 #
-# Requirements:
-#   pip install streamlit requests beautifulsoup4 lxml pandas xlsxwriter urllib3 gspread google-auth
+# Features kept from v1:
+# - Extract: Property Name, Address, Management Company, Phone, Email, URLs
+# - Enrichment: follow management site to find public email/phone
+# - Messaging: per-row Call Script + Email Subject/Body
+# - Export: CSV/XLSX, Google Sheets
 #
 # Usage:
+#   pip install streamlit requests beautifulsoup4 lxml pandas xlsxwriter urllib3 gspread google-auth
 #   streamlit run app.py
 
 import re
@@ -40,31 +45,40 @@ except Exception:
 # ----------------------------
 # Streamlit Page Setup
 # ----------------------------
-st.set_page_config(page_title="Multifamily Lead Finder", page_icon="🏢", layout="wide")
-st.title("🏢 Multifamily Lead Finder — Apartments.com + RentCafe → CSV/XLSX/Google Sheets")
+st.set_page_config(page_title="Multifamily Lead Finder v2", page_icon="🏢", layout="wide")
+st.title("🏢 Multifamily Lead Finder — v2")
 
 st.write(
-    "Find **multifamily properties** and **management contacts** for outreach.\n\n"
-    "Enter a **City & State** (e.g., `Miami, FL`) or paste a **search URL** from Apartments.com or RentCafe."
+    "Scrape **Apartments.com** and **RentCafe** for multifamily leads (Property, Address, Management, Phone/Email).\n"
+    "Includes enrichment from management sites, message templates, and export to CSV/XLSX/Google Sheets.\n\n"
+    "If listing pages are blocked, use **Manual URLs** mode to paste property links you gathered in your browser."
 )
 
 # ----------------------------
 # Helpers
 # ----------------------------
-UA = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
-    ),
+UA_ROTATE = [
+    # A few modern desktop UAs
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+]
+
+DEFAULT_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Cache-Control": "no-cache",
 }
 
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
 PHONE_RE = re.compile(r"(?:(?:\+?1[\s\-\.]?)?(?:\(?\d{3}\)?[\s\-\.]?)\d{3}[\s\-\.]?\d{4})", re.MULTILINE | re.DOTALL)
 
-def make_session() -> requests.Session:
+CAPTCHA_PATTERNS = [
+    re.compile(r"are you human|captcha|verif(y|ication)|unusual traffic", re.I),
+    re.compile(r"Just a moment\.", re.I), # common CDN interstitial
+]
+
+def make_session(referer: str = "") -> requests.Session:
     s = requests.Session()
     retry = Retry(
         total=4,
@@ -75,18 +89,31 @@ def make_session() -> requests.Session:
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.mount("http://", HTTPAdapter(max_retries=retry))
-    s.headers.update(UA)
+    s.headers.update(DEFAULT_HEADERS)
+    s.headers["User-Agent"] = random.choice(UA_ROTATE)
+    if referer:
+        s.headers["Referer"] = referer
     return s
 
 def polite_sleep(min_s: float, max_s: float):
     time.sleep(random.uniform(min_s, max_s))
 
-def safe_get(session: requests.Session, url: str, timeout: int = 20):
+def looks_blocked(text: str) -> bool:
+    t = text[:5000]  # check first chunk
+    for pat in CAPTCHA_PATTERNS:
+        if pat.search(t):
+            return True
+    return False
+
+def safe_get(session: requests.Session, url: str, timeout: int = 25):
     try:
+        session.headers["User-Agent"] = random.choice(UA_ROTATE)
         resp = session.get(url, timeout=timeout)
+        if resp is None:
+            return None
         if resp.status_code in (403, 429):
-            # gentle retry after small nap
             polite_sleep(1.0, 2.0)
+            session.headers["User-Agent"] = random.choice(UA_ROTATE)
             resp = session.get(url, timeout=timeout)
         return resp
     except requests.RequestException:
@@ -104,8 +131,59 @@ def first_nonempty(*args):
     return ""
 
 # ----------------------------
+# JSON-LD utilities (helps when listing pages are JS-heavy)
+# ----------------------------
+
+def parse_json_ld_nodes(soup: BeautifulSoup) -> List[dict]:
+    nodes = []
+    for tag in soup.select('script[type="application/ld+json"]'):
+        try:
+            data = json.loads(tag.get_text(strip=True))
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            nodes.append(data)
+        elif isinstance(data, list):
+            nodes.extend([d for d in data if isinstance(d, dict)])
+    # flatten @graph
+    flat = []
+    for d in nodes:
+        if isinstance(d, dict) and "@graph" in d and isinstance(d["@graph"], list):
+            flat.extend([g for g in d["@graph"] if isinstance(g, dict)])
+        else:
+            flat.append(d)
+    return flat
+
+
+def extract_itemlist_links(soup: BeautifulSoup, base_url: str) -> List[str]:
+    links = []
+    for node in parse_json_ld_nodes(soup):
+        if node.get("@type") in ("ItemList", ["ItemList"]):
+            elems = node.get("itemListElement") or []
+            for e in elems:
+                try:
+                    # formats vary: e may be dict with item.url or url
+                    if isinstance(e, dict):
+                        item = e.get("item") if isinstance(e.get("item"), dict) else e
+                        url = item.get("url") or item.get("@id") or e.get("url")
+                        if url:
+                            full = urljoin(base_url, url)
+                            links.append(full.split("?")[0].rstrip("/"))
+                except Exception:
+                    pass
+    # de-dup
+    out = []
+    seen = set()
+    for u in links:
+        if u not in seen:
+            out.append(u)
+            seen.add(u)
+    return out
+
+# ----------------------------
 # Site-specific: Apartments.com
 # ----------------------------
+
 def apts_build_listing_urls(city: str, state: str, pages: int) -> List[str]:
     base = f"https://www.apartments.com/{city.strip().lower().replace(' ', '-')}-{state.strip().lower()}/"
     urls = []
@@ -115,64 +193,83 @@ def apts_build_listing_urls(city: str, state: str, pages: int) -> List[str]:
         else:
             urls.append(f"{base}?page={p}")
             urls.append(urljoin(base, f"{p}/"))
-    seen = set()
-    out = []
+    # de-dup
+    out, seen = [], set()
     for u in urls:
         if u not in seen:
             out.append(u)
             seen.add(u)
     return out
 
+
 def apts_collect_property_links(soup: BeautifulSoup, base_url: str) -> List[str]:
     links = set()
-    for a in soup.select("a[href]"):
-        href = a.get("href", "")
-        if not href:
-            continue
-        full = urljoin(base_url, href)
-        netloc = urlparse(full).netloc
-        if "apartments.com" in netloc:
-            if "/property/" in full or "/apartments/" in full or full.count("/") > 4:
+    # 1) Try common anchors on modern pages
+    selectors = [
+        "a.property-link",
+        'a[data-test-id*="property-card-link"]',
+        'a[data-tile-track*="PropertyCard"]',
+        'a[href*="/property/"]',
+        'a[href*="/apartments/"]',
+    ]
+    for sel in selectors:
+        for a in soup.select(sel):
+            href = a.get("href", "")
+            if not href:
+                continue
+            full = urljoin(base_url, href)
+            if "apartments.com" in urlparse(full).netloc:
                 links.add(full.split("?")[0].rstrip("/"))
+
+    # 2) Fallback: parse JSON-LD ItemList (works even when cards are JS-rendered)
+    for u in extract_itemlist_links(soup, base_url):
+        if "apartments.com" in urlparse(u).netloc:
+            links.add(u)
+
     return list(links)
 
+
 def apts_is_property_detail(soup: BeautifulSoup) -> bool:
-    # heuristic: many detail pages have "Managed by" somewhere
+    # Heuristics: "Managed by" label, floor-plan widget, or ApartmentComplex JSON-LD
     if soup.find(string=re.compile(r"Managed by", re.I)):
         return True
-    # or the presence of floorplans container
     if soup.select_one('[data-testid*="floor-plan"]'):
         return True
+    for node in parse_json_ld_nodes(soup):
+        t = node.get("@type")
+        if isinstance(t, str) and ("Apartment" in t or "Place" in t):
+            return True
+        if isinstance(t, list) and any("Apartment" in x or "Place" in x for x in t):
+            return True
     return False
+
 
 def apts_extract_details(session: requests.Session, url: str, follow_mgmt: bool, delay_min: float, delay_max: float) -> Optional[Dict]:
     r = safe_get(session, url, 25)
     if not (r and r.ok):
         return None
+    if looks_blocked(r.text):
+        st.warning("Apartments.com property page appears blocked by anti-bot. Try Manual URLs mode or increase delays.")
+        return None
     soup = BeautifulSoup(r.text, "html.parser")
     if not apts_is_property_detail(soup):
         return None
 
-    name = ""
-    address = ""
-    mgmt = ""
-    phone = ""
-    email = ""
-    mgmt_url = ""
+    name = ""; address = ""; mgmt = ""; phone = ""; email = ""; mgmt_url = ""
 
-    # name
+    # Name
     h1 = soup.find(["h1", "h2"], string=True)
     if h1:
         name = clean_text(h1.get_text())
 
-    # address
+    # Address
     addr_tag = soup.find(attrs={"data-testid": re.compile(r"property-address|address", re.I)}) or \
                soup.find("address") or \
                soup.find("div", class_=re.compile(r"property-address|address", re.I))
     if addr_tag:
         address = clean_text(addr_tag.get_text())
 
-    # phone
+    # Phone
     tel = soup.select_one('a[href^="tel:"]')
     if tel:
         phone = clean_text(tel.get_text() or tel.get("href", "").replace("tel:", ""))
@@ -181,7 +278,7 @@ def apts_extract_details(session: requests.Session, url: str, follow_mgmt: bool,
         if m:
             phone = clean_text(m.group(0))
 
-    # mgmt + mgmt_url
+    # Management + mgmt_url
     label = soup.find(string=re.compile(r"Managed by", re.I))
     if label:
         block = label.parent if hasattr(label, "parent") else None
@@ -194,11 +291,11 @@ def apts_extract_details(session: requests.Session, url: str, follow_mgmt: bool,
             else:
                 mgmt = first_nonempty(mgmt, block.get_text())
 
-    # follow mgmt site for email/phone
+    # Follow management site
     if follow_mgmt and mgmt_url:
         polite_sleep(delay_min, delay_max)
         r2 = safe_get(session, mgmt_url, 25)
-        if r2 and r2.ok:
+        if r2 and r2.ok and not looks_blocked(r2.text):
             s2 = BeautifulSoup(r2.text, "html.parser")
             if not email:
                 m = EMAIL_RE.search(s2.get_text(" ", strip=True))
@@ -209,7 +306,6 @@ def apts_extract_details(session: requests.Session, url: str, follow_mgmt: bool,
                 if t2:
                     phone = clean_text(t2.get_text() or t2.get("href", "").replace("tel:", ""))
             if not email:
-                # check mailto links
                 mlinks = [a.get("href") for a in s2.select('a[href^="mailto:"]')]
                 mlinks = [x.replace("mailto:", "") for x in mlinks if x]
                 if mlinks:
@@ -229,71 +325,70 @@ def apts_extract_details(session: requests.Session, url: str, follow_mgmt: bool,
 # ----------------------------
 # Site-specific: RentCafe
 # ----------------------------
+
 def rentcafe_build_listing_urls(city: str, state: str, pages: int) -> List[str]:
-    # Common RentCafe geo pattern: https://www.rentcafe.com/apartments-for-rent/us/fl/miami/
     base = f"https://www.rentcafe.com/apartments-for-rent/us/{state.strip().lower()}/{city.strip().lower().replace(' ', '-')}/"
-    urls = []
-    for p in range(1, pages + 1):
-        if p == 1:
-            urls.append(base)
-        else:
-            urls.append(f"{base}?page={p}")
-    return urls
+    return [base if p == 1 else f"{base}?page={p}" for p in range(1, pages + 1)]
+
 
 def rentcafe_collect_property_links(soup: BeautifulSoup, base_url: str) -> List[str]:
     links = set()
-    # cards link to detail pages
-    for a in soup.select("a[href].property-title, a[href].card-title, a[href].btn-details"):
-        href = a.get("href", "")
-        if not href:
-            continue
-        full = urljoin(base_url, href)
-        if "rentcafe.com" in urlparse(full).netloc:
-            links.add(full.split("?")[0].rstrip("/"))
-    # fallback: any anchor to rentcafe property detail
-    for a in soup.select("a[href]"):
-        href = a.get("href", "")
-        if not href:
-            continue
-        full = urljoin(base_url, href)
-        if "rentcafe.com" in urlparse(full).netloc and "/apartments/" in full:
-            links.add(full.split("?")[0].rstrip("/"))
+    selectors = [
+        "a.card-title, a.property-title, a.btn-details, .property-name a, .js-CommunityName a",
+        'a[href*="/apartments/"]',
+    ]
+    for sel in selectors:
+        for a in soup.select(sel):
+            href = a.get("href", "")
+            if not href:
+                continue
+            full = urljoin(base_url, href)
+            if "rentcafe.com" in urlparse(full).netloc:
+                links.add(full.split("?")[0].rstrip("/"))
+
+    # JSON-LD ItemList fallback
+    for u in extract_itemlist_links(soup, base_url):
+        if "rentcafe.com" in urlparse(u).netloc:
+            links.add(u)
+
     return list(links)
 
+
 def rentcafe_is_property_detail(soup: BeautifulSoup) -> bool:
-    # presence of community-details or managed by text
     if soup.find(string=re.compile(r"Managed by|Management", re.I)):
         return True
     if soup.select_one(".community-details, .community-header, #communityName"):
         return True
+    for node in parse_json_ld_nodes(soup):
+        t = node.get("@type")
+        if isinstance(t, str) and ("Apartment" in t or "Place" in t):
+            return True
+        if isinstance(t, list) and any("Apartment" in x or "Place" in x for x in t):
+            return True
     return False
+
 
 def rentcafe_extract_details(session: requests.Session, url: str, follow_mgmt: bool, delay_min: float, delay_max: float) -> Optional[Dict]:
     r = safe_get(session, url, 25)
     if not (r and r.ok):
         return None
+    if looks_blocked(r.text):
+        st.warning("RentCafe property page appears blocked by anti-bot. Try Manual URLs mode or increase delays.")
+        return None
     soup = BeautifulSoup(r.text, "html.parser")
     if not rentcafe_is_property_detail(soup):
         return None
 
-    name = ""
-    address = ""
-    mgmt = ""
-    phone = ""
-    email = ""
-    mgmt_url = ""
+    name = ""; address = ""; mgmt = ""; phone = ""; email = ""; mgmt_url = ""
 
-    # name
     name_tag = soup.select_one("#communityName, h1, .community-header h1")
     if name_tag:
         name = clean_text(name_tag.get_text())
 
-    # address
     addr_tag = soup.select_one(".community-address, .address, address")
     if addr_tag:
         address = clean_text(addr_tag.get_text())
 
-    # phone
     tel = soup.select_one('a[href^="tel:"]')
     if tel:
         phone = clean_text(tel.get_text() or tel.get("href", "").replace("tel:", ""))
@@ -302,7 +397,6 @@ def rentcafe_extract_details(session: requests.Session, url: str, follow_mgmt: b
         if m:
             phone = clean_text(m.group(0))
 
-    # management
     mgmt_label = soup.find(string=re.compile(r"Managed by|Management", re.I))
     if mgmt_label:
         block = mgmt_label.parent if hasattr(mgmt_label, "parent") else None
@@ -315,11 +409,10 @@ def rentcafe_extract_details(session: requests.Session, url: str, follow_mgmt: b
             else:
                 mgmt = first_nonempty(mgmt, block.get_text())
 
-    # follow mgmt site
     if follow_mgmt and mgmt_url:
         polite_sleep(delay_min, delay_max)
         r2 = safe_get(session, mgmt_url, 25)
-        if r2 and r2.ok:
+        if r2 and r2.ok and not looks_blocked(r2.text):
             s2 = BeautifulSoup(r2.text, "html.parser")
             if not email:
                 m = EMAIL_RE.search(s2.get_text(" ", strip=True))
@@ -347,15 +440,15 @@ def rentcafe_extract_details(session: requests.Session, url: str, follow_mgmt: b
     }
 
 # ----------------------------
-# Enrichment / Generic site scan (Entrata/Yardi/etc.)
+# Generic enrichment (Entrata/Yardi/etc.)
 # ----------------------------
+
 def generic_enrich_site(session: requests.Session, url: str) -> Dict[str, str]:
     info = {"email": "", "phone": ""}
     r = safe_get(session, url, 25)
-    if not (r and r.ok):
+    if not (r and r.ok) or looks_blocked(r.text):
         return info
     s = BeautifulSoup(r.text, "html.parser")
-    # email
     m = EMAIL_RE.search(s.get_text(" ", strip=True))
     if m:
         info["email"] = clean_text(m.group(0))
@@ -364,7 +457,6 @@ def generic_enrich_site(session: requests.Session, url: str) -> Dict[str, str]:
         mailtos = [x.replace("mailto:", "") for x in mailtos if x]
         if mailtos:
             info["email"] = clean_text(mailtos[0])
-    # phone
     if not info["phone"]:
         tel = s.select_one('a[href^="tel:"]')
         if tel:
@@ -376,8 +468,9 @@ def generic_enrich_site(session: requests.Session, url: str) -> Dict[str, str]:
     return info
 
 # ----------------------------
-# Messaging (Call Script + Email Template)
+# Messaging helpers
 # ----------------------------
+
 def build_call_script(property_name: str, address: str, mgmt: str) -> str:
     opener = f"Hi, this is Luis with Miami Master Flooring. Is the property manager available for {property_name or 'your community'}?"
     value = (
@@ -394,6 +487,7 @@ def build_call_script(property_name: str, address: str, mgmt: str) -> str:
     if mgmt:
         parts.insert(0, f"Hi {mgmt} team" if " " not in mgmt else f"Hi {mgmt},")
     return "\n\n".join(parts)
+
 
 def build_email_template(property_name: str, address: str, mgmt: str) -> Dict[str, str]:
     subj = f"{property_name or 'Your Community'} — Fast, budget-friendly flooring turns (SPC/LVT/Carpet Tile)"
@@ -423,6 +517,7 @@ def build_email_template(property_name: str, address: str, mgmt: str) -> Dict[st
 # ----------------------------
 # Google Sheets (Service Account)
 # ----------------------------
+
 def get_gs_client_from_secrets():
     if not HAS_GSHEETS:
         return None, "gspread/google-auth not installed"
@@ -442,6 +537,7 @@ def get_gs_client_from_secrets():
     except Exception as e:
         return None, str(e)
 
+
 def append_to_sheet(df: pd.DataFrame, spreadsheet_id: str, worksheet_name: str) -> str:
     client, err = get_gs_client_from_secrets()
     if err or client is None:
@@ -456,12 +552,9 @@ def append_to_sheet(df: pd.DataFrame, spreadsheet_id: str, worksheet_name: str) 
             ws = sh.worksheet(worksheet_name)
         except Exception:
             ws = sh.add_worksheet(title=worksheet_name, rows="1000", cols="26")
-
-        # Ensure header
         existing = ws.get_all_values()
         if not existing:
             ws.append_row(list(df.columns))
-        # Append rows
         rows = df.astype(str).values.tolist()
         for r in rows:
             ws.append_row(r)
@@ -472,29 +565,33 @@ def append_to_sheet(df: pd.DataFrame, spreadsheet_id: str, worksheet_name: str) 
 # ----------------------------
 # UI Controls
 # ----------------------------
-mode = st.radio("Choose Input Mode", ["City & State", "Full Search URL"], horizontal=True)
+mode = st.radio("Choose Mode", ["City & State", "Full Search URL", "Manual Property URLs"], horizontal=True)
 
 col_a, col_b, col_c = st.columns([2, 1, 1])
 city = state = search_url = ""
+manual_urls_text = ""
+
 if mode == "City & State":
     city = col_a.text_input("City", value="Miami")
     state = col_b.text_input("State (2-letter)", value="FL", max_chars=2)
+elif mode == "Full Search URL":
+    search_url = st.text_input("Search URL (Apartments.com or RentCafe)", value="https://www.apartments.com/miami-fl/")
 else:
-    search_url = st.text_input(
-        "Search URL (Apartments.com or RentCafe)",
-        value="https://www.apartments.com/miami-fl/"
-    )
+    manual_urls_text = st.text_area("Paste property detail URLs (one per line)", height=160, placeholder="https://www.apartments.com/property/xyz...\nhttps://www.rentcafe.com/apartments/...\n...")
 
 pages = st.number_input("Max listing pages to crawl (per source)", min_value=1, max_value=50, value=3, step=1)
 max_props = st.number_input("Max properties to process (safety cap)", min_value=1, max_value=3000, value=400, step=25)
 
-st.markdown("**Sources to scan**")
+st.markdown("**Sources to scan** (ignored in Manual URLs mode)")
 src1, src2 = st.columns(2)
 use_apartments = src1.checkbox("Apartments.com", value=True)
 use_rentcafe   = src2.checkbox("RentCafe", value=True)
 
 follow_mgmt = st.checkbox("Follow 'Managed by' / management site to hunt public email/phone", value=True)
-delay_min, delay_max = st.slider("Per-request random delay (seconds)", 0.2, 3.0, (0.6, 1.5), step=0.1)
+
+delay_min, delay_max = st.slider("Per-request random delay (seconds)", 0.2, 3.0, (0.8, 1.8), step=0.1)
+
+referer_hint = st.text_input("Optional Referer header (can slightly reduce blocks)", value="https://www.google.com/")
 
 go = st.button("🚀 Start Scan")
 
@@ -508,24 +605,20 @@ if "results" not in st.session_state:
     )
 
 # ----------------------------
-# Crawl/Extract per source
+# Crawl helpers per source
 # ----------------------------
+
 def scan_apartments(session: requests.Session, city: str, state: str, pages: int, max_props: int,
                     follow_mgmt: bool, delay_min: float, delay_max: float, base_url_override: str = "") -> List[Dict]:
     results = []
-    # derive listing urls
     if base_url_override:
         base = base_url_override if base_url_override.endswith("/") else base_url_override + "/"
         listing_urls = []
         for p in range(1, pages + 1):
-            if p == 1:
-                listing_urls.append(base)
-            else:
-                listing_urls.append(f"{base}?page={p}")
+            listing_urls.append(base if p == 1 else f"{base}?page={p}")
+            if p > 1:
                 listing_urls.append(urljoin(base, f"{p}/"))
-        # dedupe
-        seen = set()
-        listing_urls = [u for u in listing_urls if not (u in seen or seen.add(u))]
+        seen = set(); listing_urls = [u for u in listing_urls if not (u in seen or seen.add(u))]
     else:
         listing_urls = apts_build_listing_urls(city, state, pages)
 
@@ -534,16 +627,21 @@ def scan_apartments(session: requests.Session, city: str, state: str, pages: int
     progress = st.progress(0)
     for i, lu in enumerate(listing_urls, start=1):
         polite_sleep(delay_min, delay_max)
+        session.headers["Referer"] = referer_hint or ""
         r = safe_get(session, lu)
         if not (r and r.ok):
             continue
+        if looks_blocked(r.text):
+            st.warning("Apartments.com listing page looks blocked by anti-bot. Try smaller pages, increase delay, or Manual URLs mode.")
+            continue
         soup = BeautifulSoup(r.text, "html.parser")
-        prop_links.extend(apts_collect_property_links(soup, lu))
+        links = apts_collect_property_links(soup, lu)
+        prop_links.extend(links)
         progress.progress(min(i/len(listing_urls), 1.0))
 
     prop_links = list(dict.fromkeys(prop_links))
     if not prop_links:
-        st.warning("Apartments.com: no property links found.")
+        st.warning("Apartments.com: no property links found (likely blocked or HTML changed). Try Manual URLs mode or a different city.")
         return results
 
     st.write(f"🔎 Apartments.com candidates: **{len(prop_links)}**")
@@ -557,17 +655,12 @@ def scan_apartments(session: requests.Session, city: str, state: str, pages: int
         detail_prog.progress(min(idx/max_props, 1.0))
     return results
 
+
 def scan_rentcafe(session: requests.Session, city: str, state: str, pages: int, max_props: int,
                   follow_mgmt: bool, delay_min: float, delay_max: float, base_url_override: str = "") -> List[Dict]:
     results = []
     if base_url_override:
-        listing_urls = []
-        base = base_url_override
-        for p in range(1, pages + 1):
-            if p == 1:
-                listing_urls.append(base)
-            else:
-                listing_urls.append(f"{base}?page={p}")
+        listing_urls = [base_url_override if p == 1 else f"{base_url_override}?page={p}" for p in range(1, pages + 1)]
     else:
         listing_urls = rentcafe_build_listing_urls(city, state, pages)
 
@@ -576,8 +669,12 @@ def scan_rentcafe(session: requests.Session, city: str, state: str, pages: int, 
     progress = st.progress(0)
     for i, lu in enumerate(listing_urls, start=1):
         polite_sleep(delay_min, delay_max)
+        session.headers["Referer"] = referer_hint or ""
         r = safe_get(session, lu)
         if not (r and r.ok):
+            continue
+        if looks_blocked(r.text):
+            st.warning("RentCafe listing page looks blocked by anti-bot. Try smaller pages, increase delay, or Manual URLs mode.")
             continue
         soup = BeautifulSoup(r.text, "html.parser")
         prop_links.extend(rentcafe_collect_property_links(soup, lu))
@@ -585,7 +682,7 @@ def scan_rentcafe(session: requests.Session, city: str, state: str, pages: int, 
 
     prop_links = list(dict.fromkeys(prop_links))
     if not prop_links:
-        st.warning("RentCafe: no property links found.")
+        st.warning("RentCafe: no property links found (likely blocked or HTML changed). Try Manual URLs mode or a different city.")
         return results
 
     st.write(f"🔎 RentCafe candidates: **{len(prop_links)}**")
@@ -610,40 +707,54 @@ if go:
         st.error("Please paste a valid search URL.")
         st.stop()
 
-    session = make_session()
-    all_rows = []
+    session = make_session(referer_hint or "")
+    all_rows: List[Dict] = []
 
-    # apartments.com
-    if use_apartments:
-        if mode == "Full Search URL" and "apartments.com" in search_url.lower():
-            rows = scan_apartments(session, city, state, pages, max_props, follow_mgmt, delay_min, delay_max, base_url_override=search_url.strip())
-        else:
-            rows = scan_apartments(session, city, state, pages, max_props, follow_mgmt, delay_min, delay_max)
-        all_rows.extend(rows)
-
-    # rentcafe
-    if use_rentcafe:
-        if mode == "Full Search URL" and "rentcafe.com" in search_url.lower():
-            rows = scan_rentcafe(session, city, state, pages, max_props, follow_mgmt, delay_min, delay_max, base_url_override=search_url.strip())
-        else:
-            rows = scan_rentcafe(session, city, state, pages, max_props, follow_mgmt, delay_min, delay_max)
-        all_rows.extend(rows)
+    if mode == "Manual Property URLs":
+        urls = [u.strip() for u in manual_urls_text.splitlines() if u.strip()]
+        if not urls:
+            st.error("Paste at least one property URL.")
+            st.stop()
+        st.info(f"Processing {len(urls)} pasted property URLs…")
+        detail_prog = st.progress(0)
+        for i, url in enumerate(urls, start=1):
+            polite_sleep(delay_min, delay_max)
+            if "apartments.com" in url:
+                row = apts_extract_details(session, url, follow_mgmt, delay_min, delay_max)
+            elif "rentcafe.com" in url:
+                row = rentcafe_extract_details(session, url, follow_mgmt, delay_min, delay_max)
+            else:
+                row = None
+            if row and (row["Property Name"] or row["Address"]):
+                all_rows.append(row)
+            detail_prog.progress(min(i/len(urls), 1.0))
+    else:
+        # apartments.com
+        if use_apartments:
+            if mode == "Full Search URL" and "apartments.com" in search_url.lower():
+                rows = scan_apartments(session, city, state, int(pages), int(max_props), follow_mgmt, delay_min, delay_max, base_url_override=search_url.strip())
+            else:
+                rows = scan_apartments(session, city, state, int(pages), int(max_props), follow_mgmt, delay_min, delay_max)
+            all_rows.extend(rows)
+        # rentcafe
+        if use_rentcafe:
+            if mode == "Full Search URL" and "rentcafe.com" in search_url.lower():
+                rows = scan_rentcafe(session, city, state, int(pages), int(max_props), follow_mgmt, delay_min, delay_max, base_url_override=search_url.strip())
+            else:
+                rows = scan_rentcafe(session, city, state, int(pages), int(max_props), follow_mgmt, delay_min, delay_max)
+            all_rows.extend(rows)
 
     if not all_rows:
-        st.error("No properties parsed. Try fewer pages, adjust delays, or switch source/mode.")
+        st.error("No properties parsed. Try fewer pages, increase delays, switch source/mode, or paste URLs manually.")
         st.stop()
 
-    df = pd.DataFrame(all_rows)
-    # Dedupe
-    df = df.fillna("")
+    df = pd.DataFrame(all_rows).fillna("")
     df = df.drop_duplicates(subset=["Source URL"]).reset_index(drop=True)
     if df.duplicated(subset=["Property Name", "Address"]).any():
         df = df.drop_duplicates(subset=["Property Name", "Address"]).reset_index(drop=True)
 
-    # Generate messaging
-    call_scripts = []
-    email_subjects = []
-    email_bodies = []
+    # Messaging columns
+    call_scripts, email_subjects, email_bodies = [], [], []
     for _, r in df.iterrows():
         script = build_call_script(r.get("Property Name", ""), r.get("Address", ""), r.get("Management Company", ""))
         email = build_email_template(r.get("Property Name", ""), r.get("Address", ""), r.get("Management Company", ""))
@@ -657,7 +768,6 @@ if go:
     st.success(f"✅ Done! Parsed **{len(df)}** properties.")
     st.dataframe(df, use_container_width=True, height=480)
 
-    # Save to session
     st.session_state["results"] = df
 
     # Downloads
